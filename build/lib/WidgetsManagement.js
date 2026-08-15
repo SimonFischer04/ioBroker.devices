@@ -1,0 +1,823 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const type_detector_1 = __importDefault(require("@iobroker/type-detector"));
+const widget_utils_1 = require("../widget-utils");
+const ROOT_CATEGORY = '__root__';
+const ALIAS = 'alias.';
+const ALIAS_MAX = 'alias.0.\u9999';
+const LINKEDDEVICES = 'linkeddevices.';
+/**
+ * A state is mandatory either on its own or as a member of a group of alternatives — a thermostat's
+ * setpoint is only ever the latter, so testing `required` alone finds nothing on such a device.
+ * Twin of `isStateRequired` in src-admin/src/Components/helpers/utils.ts; the two build roots share
+ * no code.
+ */
+function isStateRequired(state) {
+    return !!state.required || !!state.requiredOneOf;
+}
+function findMainStateId(device) {
+    const state = device.states.find(s => s.id && isStateRequired(s));
+    return state?.id;
+}
+function getParentId(id) {
+    const pos = id.lastIndexOf('.');
+    return pos !== -1 ? id.substring(0, pos) : '';
+}
+/**
+ * Devices-side guard for type-detector issue #597 / #536 (twin of
+ * `removeForeignAliasStates` in src-admin/src/Devices/SmartDetector.ts).
+ *
+ * When several independent aliases are grouped under one alias device, the
+ * type-detector fills the detected device's slots — indicators as well as regular
+ * states — from the sibling channels of that grouping, so the device ends up
+ * carrying datapoints of completely different devices. We drop mappings that are
+ * aliases sitting in a different alias channel than the device's primary (required)
+ * state. Required states are never dropped, and real hardware states carry no
+ * `common.alias`, so genuine device-level indicators on a neighbouring channel stay.
+ */
+function removeForeignAliasStates(device, objects) {
+    // Only a mandatory state may define the home channel — see the twin for why there is no fallback
+    // to "the first state with an ID".
+    const primaryId = findMainStateId(device);
+    if (!primaryId) {
+        return;
+    }
+    const homeChannel = getParentId(primaryId);
+    for (const state of device.states) {
+        if (!state.id || isStateRequired(state)) {
+            continue;
+        }
+        const common = objects[state.id]?.common;
+        if (!common?.alias) {
+            continue;
+        }
+        if (getParentId(state.id) !== homeChannel) {
+            state.id = '';
+        }
+    }
+}
+class DevicesWidgetsManagement extends widget_utils_1.WidgetsManagement {
+    detector = new type_detector_1.default();
+    objects = {};
+    enumIds = [];
+    /** IDs collected from enum members only */
+    enumMemberIds = [];
+    idsInEnums = [];
+    /** All detected devices */
+    allDevices = [];
+    /** Only devices with `common.custom[namespace].enabled === true` */
+    enabledDevices = [];
+    loaded = null;
+    notifyTimeout = null;
+    invalidatedIds = [];
+    /** Lazily rebuilt sorted keys cache */
+    _sortedKeys = null;
+    /** Maps alias.0.X folder IDs to a same-named enum.rooms.* category that should subsume them. */
+    aliasFolderRedirects = new Map();
+    // ── Sorted keys cache ──────────────────────────────────────────────
+    getSortedKeys() {
+        this._sortedKeys ||= Object.keys(this.objects).sort();
+        return this._sortedKeys;
+    }
+    invalidateKeys() {
+        this._sortedKeys = null;
+    }
+    // ── Helpers ────────────────────────────────────────────────────────
+    /**
+     * Resolve the channelId for a detected device (same logic as updateEnumsForOneDevice).
+     */
+    resolveChannelId(device) {
+        const mainStateId = findMainStateId(device);
+        if (!mainStateId) {
+            device.storeId = '';
+            return;
+        }
+        const statesCount = device.states.filter(state => state.id).length;
+        let storeId = mainStateId;
+        if (mainStateId.includes('.') &&
+            (statesCount > 1 || storeId.startsWith(ALIAS) || storeId.startsWith(LINKEDDEVICES))) {
+            storeId = getParentId(mainStateId);
+            if (!this.objects[storeId]?.common ||
+                (this.objects[storeId].type !== 'channel' &&
+                    this.objects[storeId].type !== 'device' &&
+                    this.objects[storeId].type !== 'folder')) {
+                storeId = mainStateId;
+            }
+        }
+        device.storeId = storeId;
+        const channelId = getParentId(storeId);
+        if (this.objects[channelId]?.common &&
+            (this.objects[channelId].type === 'device' || this.objects[channelId].type === 'channel')) {
+            device.channelId = channelId;
+            if (this.objects[channelId].type === 'channel') {
+                const deviceId = getParentId(channelId);
+                if (this.objects[deviceId]?.type === 'device') {
+                    device.deviceId = deviceId;
+                }
+            }
+        }
+        else {
+            device.channelId = storeId;
+        }
+    }
+    /**
+     * Rebuild enumIds and enumMemberIds by scanning all objects for enums.
+     * This is the expensive part — only call when enums are actually changed.
+     */
+    rebuildEnumMemberIds() {
+        this.enumIds = [];
+        const ids = [];
+        for (const [id, obj] of Object.entries(this.objects)) {
+            if (obj.type === 'enum') {
+                this.enumIds.push(id);
+                const members = obj.common?.members;
+                if (members) {
+                    for (const m of members) {
+                        if (!ids.includes(m)) {
+                            ids.push(m);
+                        }
+                    }
+                }
+            }
+        }
+        this.enumIds.sort();
+        this.enumMemberIds = ids;
+    }
+    rebuildCategories() {
+        const structure = {
+            [ROOT_CATEGORY]: [],
+        };
+        const keys = this.getSortedKeys();
+        for (const key of keys) {
+            if (key < ALIAS) {
+                continue;
+            }
+            if (key > ALIAS_MAX) {
+                break;
+            }
+            if (!this.objects[key]) {
+                return;
+            }
+            if (this.objects[key].type === 'folder') {
+                structure[key] ||= [];
+                const parent = getParentId(key);
+                if (this.objects[parent]?.type === 'folder' || parent === 'alias.0') {
+                    if (parent === 'alias.0') {
+                        structure[ROOT_CATEGORY].push(key);
+                    }
+                    else {
+                        structure[parent] ||= [];
+                        structure[parent].push(key);
+                    }
+                }
+            }
+            else if (this.objects[key].type === 'device' || this.objects[key].type === 'channel') {
+                // A widget moved to another category counts towards *that* category, otherwise the
+                // target folder would be dropped as "empty" below and take the widget down with it.
+                const custom = this.objects[key].common?.custom;
+                const override = custom?.[this.adapter.namespace]?.parent;
+                const parent = override && this.objects[override]?.type === 'folder' ? override : getParentId(key);
+                if (this.objects[parent]?.type === 'folder' || parent === 'alias.0') {
+                    if (parent === 'alias.0') {
+                        structure[ROOT_CATEGORY].push(key);
+                    }
+                    else {
+                        structure[parent] ||= [];
+                        structure[parent].push(key);
+                    }
+                }
+            }
+        }
+        this.categories = new Map();
+        const categories = Object.keys(structure).filter(key => {
+            // Always keep ROOT_CATEGORY: room-based categories (enum.rooms.*) are added
+            // later in rebuildEnabledDevices() with parent=ROOT_CATEGORY, so without it
+            // the tree has no root and the GUI falls back to the first room.
+            if (key === ROOT_CATEGORY) {
+                return true;
+            }
+            if (structure[key].length) {
+                return true;
+            }
+            // Include empty folders marked with showEmpty, or that hold plugin/custom widgets
+            if (this.objects[key]) {
+                const custom = this.objects[key].common?.custom;
+                if (custom &&
+                    Object.values(custom).some(c => c?.showEmpty || (Array.isArray(c?.customWidgets) && c.customWidgets.length > 0))) {
+                    return true;
+                }
+            }
+            return false;
+        });
+        for (const category of categories) {
+            const parentId = category === ROOT_CATEGORY ? '' : getParentId(category);
+            this.categories.set(category, {
+                type: 'category',
+                id: category,
+                name: this.objects[category]
+                    ? this.objects[category].common.name || category.split('.').pop() || ''
+                    : '',
+                icon: this.objects[category] ? this.objects[category].common.icon : undefined,
+                color: this.objects[category] ? this.objects[category].common.color : undefined,
+                parent: category === ROOT_CATEGORY ? undefined : parentId !== 'alias.0' ? parentId : ROOT_CATEGORY,
+                custom: category !== ROOT_CATEGORY
+                    ? this.objects[category]?.common?.custom?.[this.adapter.namespace]
+                    : undefined,
+            });
+        }
+        // Remove all orphan categories
+        for (const [id, category] of this.categories) {
+            if (category.parent && !this.categories.has(category.parent)) {
+                this.categories.delete(id);
+            }
+        }
+        // Merge alias.0.X folder categories with same-named enum.rooms.* categories
+        // so devices structured under an alias folder and devices assigned to the same-named
+        // room enum appear together as a single room in the GUI.
+        this.mergeAliasFoldersWithRoomEnums();
+    }
+    getObjectDisplayName(obj) {
+        const raw = obj?.common?.name;
+        if (!raw) {
+            return '';
+        }
+        if (typeof raw === 'string') {
+            return raw;
+        }
+        const lang = this.adapter.language || 'en';
+        return raw[lang] || raw.en || Object.values(raw).find(Boolean) || '';
+    }
+    /**
+     * Build alias→enum redirects, replace alias-folder categories with their enum.rooms.*
+     * counterpart (re-parenting sub-categories) so the merged room shows up only once.
+     */
+    mergeAliasFoldersWithRoomEnums() {
+        this.aliasFolderRedirects = new Map();
+        if (!this.categories) {
+            return;
+        }
+        // displayName -> enum.rooms.* id
+        const roomByName = new Map();
+        for (const enumId of this.enumIds) {
+            if (!enumId.startsWith('enum.rooms.')) {
+                continue;
+            }
+            const name = this.getObjectDisplayName(this.objects[enumId]);
+            if (name && !roomByName.has(name)) {
+                roomByName.set(name, enumId);
+            }
+        }
+        if (!roomByName.size) {
+            return;
+        }
+        for (const [id] of this.categories) {
+            if (!id.startsWith('alias.0.') || this.objects[id]?.type !== 'folder') {
+                continue;
+            }
+            const name = this.getObjectDisplayName(this.objects[id]);
+            const enumId = name ? roomByName.get(name) : undefined;
+            if (enumId && enumId !== id) {
+                this.aliasFolderRedirects.set(id, enumId);
+            }
+        }
+        for (const [aliasId, enumId] of this.aliasFolderRedirects) {
+            const aliasCat = this.categories.get(aliasId);
+            if (!aliasCat) {
+                continue;
+            }
+            if (!this.categories.has(enumId)) {
+                const enumObj = this.objects[enumId];
+                this.categories.set(enumId, {
+                    type: 'category',
+                    id: enumId,
+                    name: enumObj ? enumObj.common.name || enumId.split('.').pop() || '' : aliasCat.name,
+                    icon: enumObj?.common.icon ?? aliasCat.icon,
+                    color: enumObj?.common.color ?? aliasCat.color,
+                    parent: ROOT_CATEGORY,
+                    custom: enumObj?.common.custom?.[this.adapter.namespace] ?? aliasCat.custom,
+                });
+            }
+            // Re-parent any direct children of the alias folder onto the enum category
+            for (const child of this.categories.values()) {
+                if (child.parent === aliasId) {
+                    child.parent = enumId;
+                }
+            }
+            this.categories.delete(aliasId);
+        }
+    }
+    /**
+     * Rebuild idsInEnums by adding alias/linkeddevices channels/devices
+     * not already covered by enumMemberIds. Cheap — only scans the relevant key range.
+     */
+    rebuildAliasIds() {
+        const ids = [...this.enumMemberIds];
+        const keys = this.getSortedKeys();
+        const END = `${LINKEDDEVICES}\u9999`;
+        for (const key of keys) {
+            if (key < ALIAS) {
+                continue;
+            }
+            if (key > END) {
+                break;
+            }
+            if ((key.startsWith(ALIAS) || key.startsWith(LINKEDDEVICES)) && this.objects[key] && !ids.includes(key)) {
+                if (this.objects[key].type === 'device') {
+                    ids.push(key);
+                }
+                else if (this.objects[key].type === 'channel') {
+                    const parentId = getParentId(key);
+                    if (!this.objects[parentId] || !ids.includes(parentId)) {
+                        ids.push(key);
+                    }
+                }
+            }
+        }
+        this.idsInEnums = ids.sort();
+    }
+    /**
+     * Full rebuild of idsInEnums (enum scan + alias scan). Only used for initial load.
+     */
+    rebuildIdsInEnums() {
+        this.rebuildEnumMemberIds();
+        this.rebuildAliasIds();
+        this.rebuildCategories();
+    }
+    /**
+     * Run ChannelDetector.detect() only for the given IDs. Returns newly detected devices.
+     */
+    detectForIds(ids) {
+        if (!ids.length) {
+            return [];
+        }
+        const keys = this.getSortedKeys();
+        const usedIds = [];
+        const result = [];
+        for (const id of ids) {
+            const detected = this.detector.detect({
+                id,
+                objects: this.objects,
+                _usedIdsOptional: usedIds,
+                _keysOptional: keys,
+                ignoreCache: true,
+            });
+            if (detected) {
+                for (const device of detected) {
+                    const d = device;
+                    // #597/#536: strip datapoints leaked from sibling channels of an alias grouping
+                    removeForeignAliasStates(d, this.objects);
+                    this.resolveChannelId(d);
+                    if (d.storeId) {
+                        result.push(d);
+                        break; // ignore "smaller" devices
+                    }
+                }
+            }
+        }
+        return result;
+    }
+    /**
+     * Remove devices from allDevices whose channelId matches any of the given IDs.
+     */
+    removeDevicesForChannelIds(channelIds) {
+        if (!channelIds.length) {
+            return;
+        }
+        const set = new Set(channelIds);
+        this.allDevices = this.allDevices.filter(d => !set.has(d.storeId));
+    }
+    findIdInEnums(lookForId) {
+        // Try to find room to which this device belongs to
+        let useEnum = '';
+        for (const enumId of this.enumIds) {
+            if (enumId.startsWith('enum.rooms.')) {
+                const enumObj = this.objects[enumId];
+                if (enumObj?.common?.members?.includes(lookForId) ||
+                    enumObj?.common?.members?.find(id => id.startsWith(`${lookForId}.`))) {
+                    useEnum = enumId;
+                }
+            }
+        }
+        if (!useEnum) {
+            for (const enumId of this.enumIds) {
+                if (enumId.startsWith('enum.functions.')) {
+                    const enumObj = this.objects[enumId];
+                    if (enumObj?.common?.members?.includes(lookForId) ||
+                        enumObj?.common?.members?.find(id => id.startsWith(`${lookForId}.`))) {
+                        useEnum = enumId;
+                    }
+                }
+            }
+        }
+        if (!useEnum) {
+            for (const enumId of this.enumIds) {
+                const enumObj = this.objects[enumId];
+                if (enumObj?.common?.members?.includes(lookForId) ||
+                    enumObj?.common?.members?.find(id => id.startsWith(`${lookForId}.`))) {
+                    useEnum = enumId;
+                }
+            }
+        }
+        return useEnum;
+    }
+    /**
+     * Rebuild enabledDevices from allDevices (cheap, no I/O, no detection).
+     * Only devices with `common.custom[namespace].enabled === true` are included.
+     */
+    rebuildEnabledDevices() {
+        const customKey = this.adapter.namespace;
+        const oldEnabledDevices = JSON.stringify(this.enabledDevices);
+        this.enabledDevices = this.allDevices.filter(d => d.storeId && this.objects[d.storeId]?.common?.custom?.[customKey]?.enabled);
+        // Special case: the devices not from alias.0
+        for (const device of this.enabledDevices) {
+            // try to find a parent category
+            const directParent = getParentId(device.storeId);
+            // If the device's alias folder has been merged into a same-named enum.rooms.*,
+            // route the device to the enum category instead.
+            let parentId = this.aliasFolderRedirects.get(directParent) || directParent;
+            if (parentId && this.categories?.has(parentId)) {
+                device.parentId = parentId;
+                continue;
+            }
+            if (parentId.startsWith(ALIAS) || parentId.startsWith(LINKEDDEVICES)) {
+                device.parentId = parentId;
+                let parentCategoryId = getParentId(parentId);
+                // Create virtual category
+                this.categories?.set(parentId, {
+                    type: 'category',
+                    id: parentId,
+                    name: this.objects[parentId]
+                        ? this.objects[parentId].common.name || parentId.split('.').pop() || ''
+                        : '',
+                    icon: this.objects[parentId] ? this.objects[parentId].common.icon : undefined,
+                    color: this.objects[parentId] ? this.objects[parentId].common.color : undefined,
+                    parent: parentCategoryId === 'alias.0' ? ROOT_CATEGORY : parentCategoryId,
+                    custom: this.objects[parentId]?.common.custom?.[this.adapter.namespace],
+                });
+                parentId = parentCategoryId;
+                parentCategoryId = getParentId(parentId);
+                while (parentId !== 'alias.0' && parentId && !this.categories?.has(parentId)) {
+                    // Create virtual category
+                    this.categories?.set(parentId, {
+                        type: 'category',
+                        id: parentId,
+                        name: this.objects[parentId]
+                            ? this.objects[parentId].common.name || parentId.split('.').pop() || ''
+                            : '',
+                        icon: this.objects[parentId] ? this.objects[parentId].common.icon : undefined,
+                        color: this.objects[parentId] ? this.objects[parentId].common.color : undefined,
+                        parent: parentCategoryId === 'alias.0' ? ROOT_CATEGORY : parentCategoryId,
+                        custom: this.objects[parentId]?.common.custom?.[this.adapter.namespace],
+                    });
+                    parentId = parentCategoryId;
+                    parentCategoryId = getParentId(parentId);
+                }
+            }
+            else {
+                // Try to find room to which this device belongs to
+                let useEnum = this.findIdInEnums(device.storeId);
+                useEnum ||= this.findIdInEnums(device.channelId);
+                useEnum ||= this.findIdInEnums(device.deviceId);
+                if (useEnum) {
+                    device.parentId = useEnum;
+                    let parentCategoryId = getParentId(useEnum);
+                    // Do not overwrite a pre-existing category (e.g. one created by
+                    // mergeAliasFoldersWithRoomEnums, which may carry merged icon/color/custom).
+                    if (!this.categories?.has(useEnum)) {
+                        this.categories?.set(useEnum, {
+                            type: 'category',
+                            id: useEnum,
+                            name: this.objects[useEnum]
+                                ? this.objects[useEnum].common.name || useEnum.split('.').pop() || ''
+                                : '',
+                            icon: this.objects[useEnum] ? this.objects[useEnum].common.icon : undefined,
+                            color: this.objects[useEnum] ? this.objects[useEnum].common.color : undefined,
+                            parent: parentCategoryId.split('.').length > 2 ? parentCategoryId : ROOT_CATEGORY,
+                            custom: this.objects[useEnum]?.common.custom?.[this.adapter.namespace],
+                        });
+                    }
+                    parentId = parentCategoryId;
+                    parentCategoryId = getParentId(parentId);
+                    while (parentId.split('.').length > 2 && parentId && !this.categories?.has(parentId)) {
+                        // Create virtual category
+                        this.categories?.set(parentId, {
+                            type: 'category',
+                            id: parentId,
+                            name: this.objects[parentId]
+                                ? this.objects[parentId].common.name || parentId.split('.').pop() || ''
+                                : '',
+                            icon: this.objects[parentId] ? this.objects[parentId].common.icon : undefined,
+                            color: this.objects[parentId] ? this.objects[parentId].common.color : undefined,
+                            parent: parentCategoryId.split('.').length > 2 ? parentCategoryId : ROOT_CATEGORY,
+                            custom: this.objects[parentId]?.common.custom?.[this.adapter.namespace],
+                        });
+                        parentId = parentCategoryId;
+                        parentCategoryId = getParentId(parentId);
+                    }
+                }
+                else {
+                    this.adapter.log.warn(`Cannot find parent for "${device.storeId}"!`);
+                }
+            }
+        }
+        return JSON.stringify(this.enabledDevices) !== oldEnabledDevices;
+    }
+    /**
+     * For a given changed object ID, find the detection IDs (from idsInEnums) that are affected.
+     * A state change affects its parent channel/device.
+     */
+    getAffectedChannelIds(id) {
+        // Direct match in idsInEnums
+        if (this.idsInEnums.includes(id)) {
+            return [id];
+        }
+        // Parent is a detection ID (state changed under a channel)
+        const parentId = getParentId(id);
+        if (parentId && this.idsInEnums.includes(parentId)) {
+            return [parentId];
+        }
+        // Grandparent (state under device>channel hierarchy)
+        const grandParentId = getParentId(parentId);
+        if (grandParentId && this.idsInEnums.includes(grandParentId)) {
+            return [grandParentId];
+        }
+        // Check if any existing device references this ID in its states
+        const affected = [];
+        for (const device of this.allDevices) {
+            if (device.storeId === id || device.states.some(s => s.id === id)) {
+                if (!affected.includes(device.storeId)) {
+                    affected.push(device.storeId);
+                }
+            }
+        }
+        return affected;
+    }
+    // ── GUI notification ───────────────────────────────────────────────
+    /**
+     * Debounced GUI notification (100ms) to batch rapid changes.
+     */
+    scheduleNotify() {
+        if (this.notifyTimeout) {
+            clearTimeout(this.notifyTimeout);
+        }
+        this.notifyTimeout = setTimeout(async () => {
+            this.notifyTimeout = null;
+            this.adapter.log.debug(`Update objects because of: ${this.invalidatedIds.join(', ')}`);
+            this.invalidatedIds = [];
+            try {
+                await this.sendCommandToGui({ command: 'all' });
+            }
+            catch {
+                // GUI may not be open — ignore
+            }
+        }, 100);
+    }
+    // ── Object change (incremental) ───────────────────────────────────
+    objectChange(id, obj) {
+        const oldObj = this.objects[id];
+        if (!oldObj && !obj) {
+            return;
+        }
+        // Update local cache
+        if (obj) {
+            // We must compare only common part
+            if (JSON.stringify(obj.common) !== JSON.stringify(this.objects[id]?.common)) {
+                this.objects[id] = obj;
+            }
+        }
+        else {
+            delete this.objects[id];
+        }
+        this.invalidateKeys();
+        // Case 1: Enum changed — rebuild enum member IDs + alias IDs, detect only the diff
+        if (oldObj?.type === 'enum' || obj?.type === 'enum' || obj?.type === 'folder' || oldObj?.type === 'folder') {
+            const oldIds = [...this.idsInEnums];
+            this.rebuildIdsInEnums();
+            const removed = oldIds.filter(x => !this.idsInEnums.includes(x));
+            const added = this.idsInEnums.filter(x => !oldIds.includes(x));
+            if (removed.length) {
+                this.removeDevicesForChannelIds(removed);
+            }
+            if (added.length) {
+                this.allDevices.push(...this.detectForIds(added));
+            }
+            if (this.rebuildEnabledDevices()) {
+                if (!this.invalidatedIds.includes(id)) {
+                    this.invalidatedIds.push(id);
+                }
+                this.scheduleNotify();
+            }
+            return;
+        }
+        // Case 2: Object under alias.* or linkeddevices.* — only alias scan needed, enum members unchanged
+        if (id.startsWith(ALIAS) || id.startsWith(LINKEDDEVICES)) {
+            const oldIds = [...this.idsInEnums];
+            this.rebuildAliasIds();
+            const affected = this.getAffectedChannelIds(id);
+            const removedFromEnums = oldIds.filter(x => !this.idsInEnums.includes(x));
+            const addedToEnums = this.idsInEnums.filter(x => !oldIds.includes(x));
+            const toRemove = [...new Set([...affected, ...removedFromEnums])];
+            this.removeDevicesForChannelIds(toRemove);
+            const toDetect = [...new Set([...affected.filter(x => this.idsInEnums.includes(x)), ...addedToEnums])];
+            if (toDetect.length) {
+                this.allDevices.push(...this.detectForIds(toDetect));
+            }
+            if (this.rebuildEnabledDevices()) {
+                if (!this.invalidatedIds.includes(id)) {
+                    this.invalidatedIds.push(id);
+                }
+                this.scheduleNotify();
+            }
+            return;
+        }
+        // Case 3: Only the enabled flag changed — just rebuild the filter (no detection)
+        const customKey = this.adapter.namespace;
+        const oldEnabled = oldObj?.common?.custom?.[customKey]?.enabled;
+        const newEnabled = obj?.common?.custom?.[customKey]?.enabled;
+        if (oldEnabled !== newEnabled) {
+            if (this.rebuildEnabledDevices()) {
+                if (!this.invalidatedIds.includes(id)) {
+                    this.invalidatedIds.push(id);
+                }
+                this.scheduleNotify();
+            }
+            return;
+        }
+        // Case 4: Object referenced by idsInEnums or existing device changed
+        const affected = this.getAffectedChannelIds(id);
+        if (affected.length) {
+            this.removeDevicesForChannelIds(affected);
+            // Re-detect even when the object was deleted: losing one datapoint rarely invalidates
+            // the whole device, and skipping this dropped it from the widget list until the next
+            // adapter restart. A channel that no longer forms a device simply yields nothing.
+            this.allDevices.push(...this.detectForIds(affected));
+            if (this.rebuildEnabledDevices()) {
+                if (!this.invalidatedIds.includes(id)) {
+                    this.invalidatedIds.push(id);
+                }
+                this.scheduleNotify();
+            }
+        }
+    }
+    // ── Initial full detection (called once) ──────────────────────────
+    async initialLoad() {
+        // Read all objects from DB — only done ONCE
+        const res = await this.adapter.getObjectListAsync({ include_docs: true });
+        const rows = res?.rows || [];
+        for (const row of rows) {
+            this.objects[row.doc._id] = row.doc;
+        }
+        this.invalidateKeys();
+        // Build idsInEnums
+        this.rebuildIdsInEnums();
+        // Detect ALL devices
+        this.allDevices = this.detectForIds(this.idsInEnums);
+        // Filter enabled
+        this.rebuildEnabledDevices();
+        // Subscribe to all object changes for incremental updates
+        await this.adapter.subscribeForeignObjectsAsync('*');
+    }
+    // ── loadDevices (called by dm-utils framework) ────────────────────
+    async loadItems() {
+        if (!this.loaded) {
+            this.loaded = this.initialLoad();
+        }
+        await this.loaded;
+        this.widgets = new Map();
+        for (const device of this.enabledDevices) {
+            const obj = this.objects[device.storeId];
+            if (!obj) {
+                continue;
+            }
+            const name = typeof obj.common.name === 'object'
+                ? obj.common.name[this.adapter.language || 'en'] || obj.common.name.en || device.storeId
+                : obj.common.name || device.storeId;
+            const icon = obj.common.icon || undefined;
+            const color = obj.common.color || undefined;
+            // delete all empty states
+            for (let i = device.states.length - 1; i >= 0; i--) {
+                // delete empty lines
+                if (!device.states[i].id) {
+                    device.states.splice(i, 1);
+                    continue;
+                }
+                // We must deliver role, as in some widgets it is used to determine the widget type.
+                // Use the actual object's common.role; fall back to the type-detector pattern role
+                // so detection still works when an adapter omits common.role on the state.
+                const role = device.states[i].role;
+                device.states[i].stateRole =
+                    this.objects[device.states[i].id]?.common?.role ?? (typeof role === 'string' ? role : undefined);
+                // Deliver the unit so the GUI can normalize/convert values (e.g. power W <-> kW).
+                const unit = this.objects[device.states[i].id]?.common?.unit;
+                device.states[i].unit = typeof unit === 'string' ? unit : undefined;
+                /** Remove useless for GUI information */
+                if (device.states[i].original) {
+                    delete device.states[i].original;
+                }
+                if (device.states[i].role) {
+                    delete device.states[i].role;
+                }
+                if (device.states[i].channelRole) {
+                    delete device.states[i].channelRole;
+                }
+                if (device.states[i].ignoreRole) {
+                    delete device.states[i].ignoreRole;
+                }
+                if (device.states[i].statesDefined) {
+                    delete device.states[i].statesDefined;
+                }
+                if (device.states[i].searchInParent) {
+                    delete device.states[i].searchInParent;
+                }
+                if (device.states[i].enums) {
+                    delete device.states[i].enums;
+                }
+                if (device.states[i].noDeviceDetection) {
+                    delete device.states[i].noDeviceDetection;
+                }
+                if (device.states[i].multiple) {
+                    delete device.states[i].multiple;
+                }
+                if (device.states[i].stateName) {
+                    delete device.states[i].stateName;
+                }
+                if (device.states[i].objectType) {
+                    delete device.states[i].objectType;
+                }
+                if (device.states[i].state) {
+                    delete device.states[i].state;
+                }
+            }
+            // Support of categories only in aliases.
+            const customData = obj.common.custom?.[this.adapter.namespace];
+            // A widget assigned to a category whose object is gone (folder deleted or renamed)
+            // would end up in no category at all and silently disappear from the GUI — with the
+            // "show in GUI" switch seemingly doing nothing. Fall back to the object tree instead.
+            // Only a *missing object* counts: a category that merely got filtered out this round
+            // must keep its widgets, otherwise a deliberate assignment would be undone silently.
+            let parent = customData?.parent || device.parentId;
+            if (customData?.parent && customData.parent !== ROOT_CATEGORY && !this.objects[customData.parent]) {
+                this.adapter.log.warn(`Widget ${device.storeId} is assigned to the no longer existing category "${customData.parent}" — showing it in "${device.parentId}". Move it once to store the new category.`);
+                parent = device.parentId;
+            }
+            this.widgets.set(device.storeId, {
+                type: 'widget',
+                id: device.storeId,
+                name,
+                icon,
+                color,
+                parent,
+                control: {
+                    type: device.type,
+                    states: device.states,
+                    storeId: '',
+                    parentId: '',
+                    deviceId: '',
+                    channelId: '',
+                },
+                custom: obj.common.custom?.[this.adapter.namespace],
+            });
+        }
+        // Remove empty categories, repeatedly: dropping a leaf can leave its parent empty, and a
+        // parent visited before its child was removed still looked occupied. `Map.forEach` follows
+        // the insertion order, so a single pass leaves empty branches behind.
+        let someDeleted;
+        do {
+            someDeleted = false;
+            for (const id of [...(this.categories?.keys() || [])]) {
+                if (id === ROOT_CATEGORY) {
+                    continue;
+                }
+                let empty = true;
+                this.widgets?.forEach(widget => {
+                    if (widget.parent === id) {
+                        empty = false;
+                    }
+                });
+                this.categories?.forEach(c => {
+                    if (c.parent === id) {
+                        empty = false;
+                    }
+                });
+                if (!empty) {
+                    continue;
+                }
+                // Keep categories marked with showEmpty in custom settings,
+                // or that contain plugin / custom widgets.
+                const obj = this.objects[id];
+                const custom = obj?.common?.custom;
+                const keep = custom &&
+                    Object.values(custom).some(c => c?.showEmpty || (Array.isArray(c?.customWidgets) && c.customWidgets.length > 0));
+                if (!keep) {
+                    this.categories?.delete(id);
+                    someDeleted = true;
+                }
+            }
+        } while (someDeleted);
+    }
+}
+exports.default = DevicesWidgetsManagement;
+//# sourceMappingURL=WidgetsManagement.js.map
